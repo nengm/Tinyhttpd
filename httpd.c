@@ -460,7 +460,7 @@ int get_line(int sock, char *buf, int size)
     if ((n > 0) && (c == '\n'))
      recv(sock, &c, 1, 0);
     else
-	//不是\n（读到第一行的字符）或者没读到，置c为\n 跳出循环,完成一行读取
+	//不是\n（读到下一行的字符）或者没读到，置c为\n 跳出循环,完成一行读取
      c = '\n';
    }
    buf[i] = c;
