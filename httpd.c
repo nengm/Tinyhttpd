@@ -279,7 +279,46 @@ void error_die(const char *sc)
  perror(sc);
  exit(1);
 }
+/*
+execute_cgi有几个前置知识需要解释
+1. fork
+2. 匿名pipe
+3. 写环境变量
+4. execl加载外部程序
+5. cgi脚本
+6. 012文件描述符
+fork
+  fork系统调用会创建出新进程，其中子进程返回的PID是0,父进程返回的PID是子进程PID,大于0.
+  刚刚复制时，父子进程拥有相同的地址空间，文件描述符资源。因此，打开的pipe描述符，也是同一个。
 
+匿名pipe
+  是一个用于阻塞式串行通信的进程通信模型。
+  pipe系统调用会返回2个文件描述符，fd0用于读pipe,fd1用于写pipe
+  一般来说，pipe是两个进程间单向通信的。试想，如果两个进程同时写，数据就乱套了。
+  因此，当fork之后，虽然父子进程都包含了pipe的读写描述符，程序里也应该选择性的关闭掉一部分描述符。
+  以便pipe正确的工作。
+  如果不关闭，fd0和fd1在父子进程都可以访问，且是同样的两个文件描述符
+
+写环境变量
+  这里使用环境变量，用于httpd服务器程序，向cgi脚本传递数据。cgi脚本从环境变量获取数据，得知此次
+  http数据包，是get/post类型，以及携带的数据，以便脚本做出正确的处理。
+  linux中putenv函数，用于写环境变量
+
+execl函数
+  这个系统调用，会把当前进程的内存映像，替换成新程序的内存映像，新程序从main函数执行。
+  因此，当前进程，execl函数之后的代码，不会被执行。
+
+cgi脚本
+  可以类比成js脚本语言。js本质上也只是生成html格式的文本，通过http协议发给浏览器，浏览器负责渲染html。
+  当然js比cgi功能强大很多。cgi脚本接受环境变量提供的输入，处理之后，向标准输出，打印输出数据。然后被httpd
+  程序接收，打包成http,转发给浏览器客户端。
+
+0 1 2文件描述符
+  标准输入 fd 0
+  标准输出 fd 1
+  标准错误 fd 2
+  函数dup2,就是把一个fd的流，重定向到新的fd流中
+*/
 /**********************************************************************/
 /* Execute a CGI script.  Will need to set environment variables as
  * appropriate.
@@ -292,7 +331,11 @@ void execute_cgi(int client, const char *path,
 //缓冲区
  char buf[1024];
 
- //2根管道
+ //2个管道，用于父子进程的双向通信
+ //这里父进程才是和cgi脚本直接通信的。
+ //子进程主要负责把pipe和标准输入输出连接起来，以及配置环境变量，但其实这些事情在父进程里配置也完全可以
+ //综合来看，父进程从http客户端接收post请求，传递给cgi脚本，再把cgi脚本的输出结果，转发给http客户端。
+ //而子进程，真正不可替代的作用，是调用execl函数，启动cgi脚本。
  int cgi_output[2];
  int cgi_input[2];
 
@@ -373,16 +416,20 @@ void execute_cgi(int client, const char *path,
   char query_env[255];
   char length_env[255];
 
-  //子进程输出重定向到output管道的1端
+  // cgi_output这个pipe的写端，重定向到标准输出流，
+  // 即cgi脚本的控制台输出，会传递到cgi_output这个pipe中。
+  // 后续父进程可以从cgi_output里读cgi脚本处理结果
   dup2(cgi_output[1], 1);
-  //子进程输入重定向到input管道的0端
+  // cgi_input这个pipe的读端，重定向到标准输入流。
+  // 这意味着以后从标准输入读取数据时，实际上是从cgi_input这个pipe中读取数据。
+  // 后续父进程向cgi_input里写入数据，等于向标准输入流写入数据
   dup2(cgi_input[0], 0);
 
-  //关闭无用管道口
+  //在子进程中，关闭另外2个pipe的端口
   close(cgi_output[0]);
   close(cgi_input[1]);
 
-  //CGI环境变量
+  //写入新的环境变量，用于后续cgi脚本使用
   sprintf(meth_env, "REQUEST_METHOD=%s", method);
   putenv(meth_env);
   if (strcasecmp(method, "GET") == 0) {
@@ -393,7 +440,7 @@ void execute_cgi(int client, const char *path,
    sprintf(length_env, "CONTENT_LENGTH=%d", content_length);
    putenv(length_env);
   }
-  //替换执行path
+  //替换后续代码的进程镜像，执行cgi脚本。
   execl(path, path, NULL);
   //int m = execl(path, path, NULL);
   //如果path有问题，例如将html网页改成可执行的，但是执行后m为-1
@@ -407,10 +454,19 @@ void execute_cgi(int client, const char *path,
   if (strcasecmp(method, "POST") == 0)
    for (i = 0; i < content_length; i++) {
 	//得到post请求数据，写到input管道中，供子进程使用
+  //其实是向标准输入流写数据，cgi脚本会从标准输入流，获取post协议携带的数据，做出处理。
+  //考虑父子进程启动顺序问题
+  /**
+   * 1. 父进程先启动，则post协议数据被存入标准输入流，等待子进程启动后，调用cgi脚本，脚本从标准输入流得到post数据
+   * 2. 子进程先启动，则需要从标准输入得到数据的cgi脚本，需要阻塞等待，直到父进程把post数据填入标准输入流。
+   * 是否有改进的方案？
+  */
     recv(client, &c, 1, 0);
     write(cgi_input[1], &c, 1);
    }
   //从output管道读到子进程处理后的信息，然后send出去
+  //其实是cgi脚本运行后，向控制台打印的标准输出流，被重定向到cgi_output这个pipe里。
+  //因此父进程是截获了cgi脚本的运行结果，转发给http客户端了。
   while (read(cgi_output[0], &c, 1) > 0)
    send(client, &c, 1, 0);
 
@@ -627,7 +683,7 @@ void unimplemented(int client)
 int main(void)
 {
  int server_sock = -1;
- u_short port = 0;
+ u_short port = 80;
  int client_sock = -1;
  struct sockaddr_in client_name;
 
